@@ -97,6 +97,8 @@ static int hf3fs_usrbio_init(struct thread_data *td) {
 }
 
 static int fio_io_end(struct thread_data *td, struct io_u *io_u, int ret) {
+    io_u->resid = 0;
+    io_u->error = 0;
     if (io_u->file && ret >= 0 && ddir_rw(io_u->ddir)) {
         LAST_POS(io_u->file) = io_u->offset + ret;
     }
@@ -107,7 +109,7 @@ static int fio_io_end(struct thread_data *td, struct io_u *io_u, int ret) {
             io_u->error = 0;
             return FIO_Q_COMPLETED;
         } else {
-            io_u->error = errno;
+            io_u->error = -ret;
         }
     }
 
@@ -157,7 +159,7 @@ static int hf3fs_usrbio_commit(struct thread_data *td) {
     bool read = (sd->last_ddir == DDIR_READ);
     auto &ior = read ? ior_r : ior_w;
     for (int i = 0; i < sd->queued; i++) {
-        res = hf3fs_prep_io(&ior, &iov, read, vec[i]->xfer_buf, vec[i]->file->fd, vec[i]->offset, vec[i]->xfer_buflen, nullptr);
+        res = hf3fs_prep_io(&ior, &iov, read, vec[i]->xfer_buf, vec[i]->file->fd, vec[i]->offset, vec[i]->xfer_buflen, vec[i]);
         if (res < 0) {
             std::cout << "prep " << res << " " << vec[i]->file->fd << std::endl;
             return res;
@@ -176,11 +178,17 @@ static int hf3fs_usrbio_commit(struct thread_data *td) {
         return res;
     }
 
+    if (res != sd->queued) {
+        return -EIO;
+    }
     for (int i = 0; i < sd->queued; i++) {
-        if (cqe[i].result < 0) {
-            std::cout << "cqe error " << res << std::endl;
-            return res;
+        auto *completed = static_cast<struct io_u *>(const_cast<void *>(cqe[i].userdata));
+        if (!completed) {
+            return -EIO;
         }
+        // Completion order is not assumed to match submission order.
+        vec[i] = completed;
+        fio_io_end(td, completed, cqe[i].result);
     }
 
     sd->events = sd->queued;
